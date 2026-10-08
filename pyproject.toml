@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-training"
+version = "0.1.0"
+description = "Base and conversational training, recoverable checkpoints and monitoring"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = ["llm-architecture==0.1.0", "llm-tokenizer==0.1.0", "llm-data[torch]==0.1.0", "numpy==2.5.1", "PyYAML==6.0.3", "tqdm==4.70.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=9,<10"]
+cuda = ["bitsandbytes==0.50.0"]
+
+[project.scripts]
+"llm-training-train" = "llm_training.cli.train:main"
+"llm-training-train-conversational-sft" = "llm_training.cli.train_conversational_sft:main"
+"llm-training-monitor-gpu" = "llm_training.cli.monitor_gpu:main"
+"llm-training-summarize-gpu" = "llm_training.cli.summarize_gpu:main"
+"llm-training-summarize-training" = "llm_training.cli.summarize_training:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["llm_training*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
