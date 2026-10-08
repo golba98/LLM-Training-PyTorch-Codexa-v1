@@ -1,0 +1,24 @@
+model:
+  vocab_size: 16384
+  context_length: 2048
+  num_layers: 24
+  hidden_size: 1536
+  num_heads: 24
+  intermediate_size: 6144
+  dropout: 0.0
+  tie_embeddings: true
+  position_embedding_type: learned
+  rope_theta: 10000.0
+
+training:
+  micro_batch_size: 1
+  gradient_accumulation_steps: 32
+  learning_rate: 0.0002
+  weight_decay: 0.1
+  warmup_steps: 2000
+  max_steps: 10000
+  gradient_clip: 1.0
+  precision: bf16
+  checkpoint_interval: 250
+  evaluation_interval: 250
+  seed: 42
