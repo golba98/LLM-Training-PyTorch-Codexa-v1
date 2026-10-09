@@ -29,3 +29,7 @@ See the central VALIDATION.md for commands, results and unverified large-model c
 The original project is preserved unchanged. No model promotion, training pipeline or remote publishing occurs as part of extraction.
 
 # LLM-Training-PyTorch-Codexa-v1
+
+## Canonical workspace integration
+
+This repository remains independently versioned at its existing remote and is pinned as a sibling in LLM-From-Scratch/compatibility.json. Integration decisions live in ../LLM-From-Scratch/documentation/training/SESSION_DECISIONS.md. Historical assets are external inputs; never commit weights, datasets or recovery snapshots.
