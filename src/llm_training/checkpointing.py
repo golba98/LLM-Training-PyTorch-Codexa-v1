@@ -22,7 +22,7 @@ from llm_training.config import ProjectConfig
 from llm_training.training import TrainingState
 
 
-from llm_architecture.checkpointing import (CHECKPOINT_FORMAT_VERSION, InferenceCheckpoint, file_sha256, verify_checkpoint_checksum, _validate_training_state, load_model_checkpoint)
+from llm_architecture.checkpointing import (CHECKPOINT_FORMAT_VERSION, InferenceCheckpoint, file_sha256, verify_checkpoint_checksum, _validate_training_state, load_model_checkpoint, read_native_checkpoint)
 
 
 @dataclass(frozen=True)
@@ -230,9 +230,21 @@ def build_checkpoint_payload(
 class CheckpointManager:
     """Save atomic latest, previous, best, and milestone checkpoints."""
 
-    def __init__(self, root: str | Path, run_name: str) -> None:
+    def __init__(self, root: str | Path, run_name: str, *, backend: str = 'legacy',
+                 store_root: Path | None = None, reserve_bytes: int = 100 * 1024**3,
+                 retention: dict | None = None, reclamation_mode: str = 'disabled') -> None:
         if not run_name or Path(run_name).name != run_name:
             raise ValueError("run_name must be a non-empty path-safe name.")
+        if backend not in ('legacy', 'optimized'):
+            raise ValueError('Unknown checkpoint storage backend.')
+        self.optimized_store = None
+        if backend == 'optimized':
+            from .optimized_recovery import OptimizedRecoveryStore
+            self.optimized_store = OptimizedRecoveryStore(Path(root) / run_name,
+                store_root=store_root, reserve_bytes=reserve_bytes, retention=retention,
+                reclamation_mode=reclamation_mode)
+        elif reclamation_mode != 'disabled':
+            raise ValueError('Reclamation simulation requires optimized storage.')
         self.run_dir = Path(root) / run_name
         self.milestone_dir = self.run_dir / "milestones"
         self.latest_path = self.run_dir / "latest.pt"
@@ -245,7 +257,12 @@ class CheckpointManager:
         *,
         is_best: bool = False,
         milestone: bool = False,
+        final: bool = False,
     ) -> Path:
+        if self.optimized_store is not None:
+            self.optimized_store.save(payload, best_validation=is_best, milestone=milestone, final=final)
+            self.latest_path = self.optimized_store.resolve()
+            return self.latest_path
         started = time.perf_counter()
         state = _validate_training_state(payload.get("training_state"))
         if self.latest_path.exists():
@@ -286,7 +303,7 @@ class CheckpointManager:
 
 
 def load_checkpoint(
-    path: str | Path,
+    path: str | Path | None,
     *,
     model: nn.Module,
     optimizer: Optimizer,
@@ -295,6 +312,9 @@ def load_checkpoint(
     expected_data_manifest_sha256: str | None = None,
     restore_rng: bool = True,
     map_location: str | torch.device = "cpu",
+    recovery_store=None,
+    recovery_role: str = "latest",
+    allow_previous: bool = False,
 ) -> LoadedCheckpoint:
     """Validate and restore a trusted local checkpoint.
 
@@ -302,14 +322,24 @@ def load_checkpoint(
     trusted sources.
     """
 
-    checkpoint_path = Path(path)
-    verify_checkpoint_checksum(checkpoint_path)
+    if recovery_store is not None:
+        if path is not None:
+            raise ValueError('Use either a checkpoint path or a recovery store.')
+        payload = recovery_store.load(recovery_role, allow_previous=allow_previous,
+                                      map_location=map_location)
+        selected = recovery_store.last_recovery_selection['selected']
+        checkpoint_path = recovery_store._record_path(selected)
+    else:
+        checkpoint_path = Path(path)
+    if recovery_store is None and not checkpoint_path.name.endswith('.ckpt.json'):
+        verify_checkpoint_checksum(checkpoint_path)
     try:
-        payload = torch.load(
-            checkpoint_path,
-            map_location=map_location,
-            weights_only=False,
-        )
+        if recovery_store is not None:
+            pass
+        elif checkpoint_path.name.endswith('.ckpt.json'):
+            payload = read_native_checkpoint(checkpoint_path, map_location=map_location)
+        else:
+            payload = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     except Exception as error:
         raise ValueError(
             f"Failed to deserialize checkpoint {checkpoint_path}: {error}"
