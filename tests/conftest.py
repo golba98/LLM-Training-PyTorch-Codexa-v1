@@ -11,13 +11,16 @@ for repo in sorted(ROOT.parent.glob("LLM-*")):
 
 
 @pytest.fixture(autouse=True)
-def explicit_training_environment(monkeypatch):
+def explicit_training_environment():
     """These tests train tiny CPU models through the public trainer functions. In the Codexa
     workspace an interpreter startup guard wraps those functions and requires an explicit
     environment selection; select development explicitly. Nothing is faked: the guard then
     validates the real workspace (pinned, committed, source-first) and fails closed otherwise.
-    Outside the workspace (no guard installed) the variable is inert."""
-    monkeypatch.setenv("CODEXA_TRAINING_ENVIRONMENT", "development")
-    guard = sys.modules.get("training_environment_guard")
-    if guard is not None:
-        monkeypatch.setattr(guard, "_selected", None)
+    Outside the workspace (no guard installed) the variable is inert. A private MonkeyPatch keeps
+    the selection in force when a test calls ``monkeypatch.undo()`` on its own patches."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("CODEXA_TRAINING_ENVIRONMENT", "development")
+        guard = sys.modules.get("training_environment_guard")
+        if guard is not None:
+            patch.setattr(guard, "_selected", None)
+        yield
