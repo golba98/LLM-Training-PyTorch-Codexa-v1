@@ -14,6 +14,7 @@ import time
 from typing import Any
 import uuid
 
+from llm_training.token_objective import weighted_token_loss, validate_target_weights
 from llm_architecture.state import TrainingState
 from llm_architecture.runtime import (PrecisionPolicy, resolve_device, resolve_precision, autocast_dtype, requires_grad_scaler, autocast_context, create_grad_scaler)
 
@@ -65,6 +66,10 @@ class TrainingMetrics:
     device: str
     precision: str
     timestamp_utc: str
+    context_tokens_processed: int = 0
+    padded_tokens_processed: int = 0
+    validation_status: str = "not_scheduled"
+    validation_seconds: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         values = {
@@ -98,18 +103,6 @@ def set_deterministic_seed(seed: int) -> torch.Generator:
     generator = torch.Generator()
     generator.manual_seed(seed)
     return generator
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def create_adamw_optimizer(
@@ -299,6 +292,9 @@ class CyclingDataIterator:
         return self._batches_in_epoch
 
     def _new_iterator(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        sampler = getattr(self.loader, "sampler", None)
+        if hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(self.completed_epochs)
         generator = getattr(self.loader, "generator", None)
         if generator is not None:
             generator.manual_seed(self.seed + self.completed_epochs)
@@ -327,6 +323,26 @@ def _finite_loss(loss: torch.Tensor, description: str) -> float:
     return value
 
 
+def unpack_training_batch(batch: object) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Accept legacy pairs or right-padded metadata-bearing chat batches.
+
+    Causal SDPA needs no explicit mask for right padding: real tokens cannot
+    attend to padding on their right. An explicit mask is validated here.
+    """
+    if isinstance(batch, Mapping):
+        ids, labels = batch["input_ids"], batch["labels"]
+        mask = batch.get("attention_mask")
+        if mask is None or mask.shape != ids.shape or mask.dtype != torch.bool:
+            raise ValueError("Chat batches require a boolean attention mask.")
+        if (mask[:, 1:] & ~mask[:, :-1]).any() or not mask[:, 0].all():
+            raise ValueError("Only right-padded conversational batches are supported.")
+        if (labels[~mask] != -100).any():
+            raise ValueError("Padding cannot bear loss.")
+        return ids, labels, int(mask.sum())
+    ids, labels = batch
+    return ids, labels, ids.numel()
+
+
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
@@ -336,6 +352,8 @@ def evaluate(
     precision: PrecisionPolicy,
     max_batches: int | None = None,
     non_blocking: bool = False,
+    deadline_monotonic: float | None = None,
+    details: dict | None = None,
 ) -> tuple[float, int]:
     """Return target-token-weighted validation loss and token count."""
 
@@ -351,9 +369,14 @@ def evaluate(
     was_training = model.training
     total_weighted_loss = 0.0
     total_tokens = 0
+    strata: dict[str, dict] = {}
+    end_loss_sum, end_tokens = 0.0, 0
     try:
         model.eval()
-        for batch_index, (input_ids, labels) in enumerate(data_loader):
+        for batch_index, batch in enumerate(data_loader):
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TimeoutError("Validation deadline reached; partial loss is not published.")
+            input_ids, labels, _ = unpack_training_batch(batch)
             if max_batches is not None and batch_index >= max_batches:
                 break
             input_ids = input_ids.to(device, non_blocking=non_blocking)
@@ -368,11 +391,38 @@ def evaluate(
                 continue
             total_weighted_loss += loss_value * token_count
             total_tokens += token_count
+            if details is not None:
+                token_losses = torch.nn.functional.cross_entropy(
+                    _logits.float().transpose(1, 2), labels, ignore_index=-100, reduction='none')
+                sources = batch.get('sources', ['unknown'] * len(labels)) if isinstance(batch, Mapping) else ['unknown'] * len(labels)
+                if len(sources) != len(labels):
+                    raise ValueError('Validation source attribution differs from batch rows.')
+                for row, source in enumerate(sources):
+                    valid = labels[row] != -100
+                    ends = labels[row] == 7
+                    stats = strata.setdefault(source, dict(loss_sum=0., tokens=0, end_loss_sum=0., end_tokens=0))
+                    stats['loss_sum'] += float(token_losses[row][valid].sum())
+                    stats['tokens'] += int(valid.sum())
+                    stats['end_loss_sum'] += float(token_losses[row][ends].sum())
+                    stats['end_tokens'] += int(ends.sum())
+                ends = labels == 7
+                end_loss_sum += float(token_losses[ends].sum())
+                end_tokens += int(ends.sum())
         if total_tokens == 0:
             raise ValueError("Validation DataLoader produced no target tokens.")
         mean_loss = total_weighted_loss / total_tokens
         if not math.isfinite(mean_loss):
             raise FloatingPointError("Final validation loss is non-finite.")
+        if details is not None:
+            complete = dict(tokens=total_tokens, loss=mean_loss, end_tokens=end_tokens,
+                end_loss=end_loss_sum/end_tokens if end_tokens else None,
+                sources={source:dict(tokens=value['tokens'],
+                    loss=value['loss_sum']/value['tokens'] if value['tokens'] else None,
+                    end_tokens=value['end_tokens'],
+                    end_loss=value['end_loss_sum']/value['end_tokens'] if value['end_tokens'] else None)
+                    for source,value in strata.items()})
+            details.clear()
+            details.update(complete)
         return mean_loss, total_tokens
     finally:
         model.train(was_training)
@@ -417,9 +467,19 @@ def train_model(
     max_micro_steps: int | None = None,
     progress: bool = False,
     deadline_monotonic: float | None = None,
+    loss_normalization: str = "microbatch",
+    target_token_weights: Mapping[int, float] | None = None,
+    stop_requested: Callable[[], bool] | None = None,
+    on_committed_batches: Callable[[list[object]], None] | None = None,
+    validation_allowed: Callable[[], bool] | None = None,
+    max_epochs: int | None = None,
+    on_validation_details: Callable[[int, dict], None] | None = None,
 ) -> tuple[TrainingState, list[TrainingMetrics]]:
     """Train until exactly ``max_steps`` optimizer updates are complete."""
 
+    validate_target_weights(target_token_weights)
+    if loss_normalization not in {"microbatch", "supervised_tokens"}:
+        raise ValueError("Unknown loss normalization policy.")
     if max_steps <= 0:
         raise ValueError("max_steps must be positive.")
     if gradient_accumulation_steps <= 0:
@@ -473,6 +533,12 @@ def train_model(
         else None
     )
     while run_state.optimizer_step < max_steps:
+        if stop_requested is not None and stop_requested():
+            break
+        if max_epochs is not None and (cycling.completed_epochs >= max_epochs or
+                (cycling.completed_epochs == max_epochs - 1 and
+                 len(train_loader) - cycling.batches_in_epoch < gradient_accumulation_steps)):
+            break
         if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
             break
         if (
@@ -487,101 +553,151 @@ def train_model(
         start_time = time.perf_counter()
         step_loss_sum = 0.0
         step_tokens = 0
+        step_context_tokens = 0
+        step_padded_tokens = 0
+        committed_batches = []
+        cursor_start = (cycling.completed_epochs, cycling.batches_in_epoch)
+        from llm_training.checkpointing import capture_random_states, restore_random_states
+        rng_start = capture_random_states()
+        state_start = run_state.to_dict()
         start_micro_step = run_state.micro_step
 
-        for _ in range(gradient_accumulation_steps):
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                optimizer.zero_grad(set_to_none=True)
-                run_state.micro_step = start_micro_step
-                run_state.tokens_seen -= step_tokens
-                raise TimeoutError("Training deadline reached during accumulation.")
-            input_ids, labels = cycling.next()
-            non_blocking = device.type == "cuda" and bool(
-                getattr(train_loader, "pin_memory", False)
+        try:
+            for _ in range(gradient_accumulation_steps):
+                if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                    optimizer.zero_grad(set_to_none=True)
+                    run_state.micro_step = start_micro_step
+                    run_state.tokens_seen -= step_tokens
+                    run_state.completed_epochs, run_state.batches_in_epoch = cursor_start
+                    restore_random_states(rng_start)
+                    raise TimeoutError("Training deadline reached during accumulation.")
+                batch = cycling.next()
+                input_ids, labels, context_count = unpack_training_batch(batch)
+                if isinstance(batch, Mapping):
+                    committed_batches.append({key: batch[key] for key in ("identities", "sources", "indices")})
+                non_blocking = device.type == "cuda" and bool(
+                    getattr(train_loader, "pin_memory", False)
+                )
+                input_ids = input_ids.to(device, non_blocking=non_blocking)
+                labels = labels.to(device, non_blocking=non_blocking)
+                with autocast_context(device, precision):
+                    if target_token_weights:
+                        _logits, _ = model(input_ids, None)
+                        raw_loss = weighted_token_loss(_logits, labels, target_token_weights)
+                    else:
+                        _logits, raw_loss = model(input_ids, labels)
+                if raw_loss is None:
+                    raise RuntimeError("Model did not return a training loss.")
+                raw_loss_value = _finite_loss(raw_loss, "training loss")
+                token_count = int((labels != -100).sum().item())
+                if token_count == 0:
+                    raise ValueError("Training batch contains no target tokens.")
+                scaled_loss = (raw_loss * token_count if loss_normalization == "supervised_tokens"
+                               else raw_loss / gradient_accumulation_steps)
+                _finite_loss(scaled_loss, "scaled training loss")
+                if scaler is None:
+                    scaled_loss.backward()
+                else:
+                    scaler.scale(scaled_loss).backward()
+
+                token_count = int((labels != -100).sum().item())
+                if token_count == 0:
+                    raise ValueError("Training batch contains no target tokens.")
+                step_loss_sum += raw_loss_value * token_count
+                step_tokens += token_count
+                step_context_tokens += context_count
+                step_padded_tokens += input_ids.numel()
+                run_state.micro_step += 1
+                run_state.tokens_seen += token_count
+                attempted_micro_steps += 1
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            forward_backward_seconds = time.perf_counter() - start_time
+            optimizer_start = time.perf_counter()
+
+            run_state.completed_epochs = cycling.completed_epochs
+            run_state.batches_in_epoch = cycling.batches_in_epoch
+            learning_rate = cosine_learning_rate(
+                run_state.optimizer_step,
+                warmup_steps=warmup_steps,
+                max_steps=max_steps,
+                peak_learning_rate=peak_learning_rate,
+                minimum_learning_rate=minimum_lr,
             )
-            input_ids = input_ids.to(device, non_blocking=non_blocking)
-            labels = labels.to(device, non_blocking=non_blocking)
-            with autocast_context(device, precision):
-                _logits, raw_loss = model(input_ids, labels)
-            if raw_loss is None:
-                raise RuntimeError("Model did not return a training loss.")
-            raw_loss_value = _finite_loss(raw_loss, "training loss")
-            scaled_loss = raw_loss / gradient_accumulation_steps
-            _finite_loss(scaled_loss, "scaled training loss")
+            for parameter_group in optimizer.param_groups:
+                parameter_group["lr"] = learning_rate
+
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+            if loss_normalization == "supervised_tokens":
+                for parameter in model.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(step_tokens)
+            gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                gradient_clip,
+            )
+            gradient_norm = float(gradient_norm_tensor.detach().float().item())
+            if not math.isfinite(gradient_norm):
+                raise FloatingPointError(
+                    f"Non-finite gradient norm: {gradient_norm!r}."
+                )
             if scaler is None:
-                scaled_loss.backward()
+                optimizer.step()
             else:
-                scaler.scale(scaled_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+            run_state.optimizer_step += 1
 
-            token_count = int((labels != -100).sum().item())
-            if token_count == 0:
-                raise ValueError("Training batch contains no target tokens.")
-            step_loss_sum += raw_loss_value * token_count
-            step_tokens += token_count
-            run_state.micro_step += 1
-            run_state.tokens_seen += token_count
-            attempted_micro_steps += 1
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            optimizer_update_seconds = time.perf_counter() - optimizer_start
+            elapsed = time.perf_counter() - start_time
+            if elapsed <= 0:
+                raise RuntimeError("Measured optimizer-step duration was not positive.")
 
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        forward_backward_seconds = time.perf_counter() - start_time
-        optimizer_start = time.perf_counter()
-
-        run_state.completed_epochs = cycling.completed_epochs
-        run_state.batches_in_epoch = cycling.batches_in_epoch
-        learning_rate = cosine_learning_rate(
-            run_state.optimizer_step,
-            warmup_steps=warmup_steps,
-            max_steps=max_steps,
-            peak_learning_rate=peak_learning_rate,
-            minimum_learning_rate=minimum_lr,
-        )
-        for parameter_group in optimizer.param_groups:
-            parameter_group["lr"] = learning_rate
-
-        if scaler is not None:
-            scaler.unscale_(optimizer)
-        gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            gradient_clip,
-        )
-        gradient_norm = float(gradient_norm_tensor.detach().float().item())
-        if not math.isfinite(gradient_norm):
-            raise FloatingPointError(
-                f"Non-finite gradient norm: {gradient_norm!r}."
-            )
-        if scaler is None:
-            optimizer.step()
-        else:
-            scaler.step(optimizer)
-            scaler.update()
-        optimizer.zero_grad(set_to_none=True)
-        run_state.optimizer_step += 1
-
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        optimizer_update_seconds = time.perf_counter() - optimizer_start
-        elapsed = time.perf_counter() - start_time
-        if elapsed <= 0:
-            raise RuntimeError("Measured optimizer-step duration was not positive.")
+        except BaseException:
+            optimizer.zero_grad(set_to_none=True)
+            for key, value in state_start.items():
+                setattr(run_state, key, value)
+            restore_random_states(rng_start)
+            raise
+        if on_committed_batches is not None:
+            on_committed_batches(committed_batches)
 
         validation_loss: float | None = None
+        validation_status = "not_scheduled"
+        validation_started = time.perf_counter()
         should_validate = (
             validation_loader is not None
             and evaluation_interval is not None
             and run_state.optimizer_step % evaluation_interval == 0
+            and (validation_allowed is None or validation_allowed())
         )
         if should_validate:
-            validation_loss, _validation_tokens = evaluate(
-                model,
-                validation_loader,
-                device=device,
-                precision=precision,
-                max_batches=max_validation_batches,
-                non_blocking=device.type == "cuda"
-                and bool(getattr(validation_loader, "pin_memory", False)),
-            )
-            if (
+            try:
+                validation_details = {} if on_validation_details is not None else None
+                validation_loss, _validation_tokens = evaluate(
+                    model,
+                    validation_loader,
+                    device=device,
+                    precision=precision,
+                    max_batches=max_validation_batches,
+                    deadline_monotonic=deadline_monotonic,
+                    non_blocking=device.type == "cuda"
+                    and bool(getattr(validation_loader, "pin_memory", False)),
+                    details=validation_details,
+                )
+                validation_status = "complete"
+                if on_validation_details is not None:
+                    on_validation_details(run_state.optimizer_step, validation_details)
+            except TimeoutError:
+                # The optimizer update is already committed. Log it even when
+                # validation runs out of time; never publish a partial loss.
+                validation_status = "deadline_skipped"
+            if validation_loss is not None and (
                 run_state.best_validation_loss is None
                 or validation_loss < run_state.best_validation_loss
             ):
@@ -612,6 +728,10 @@ def train_model(
             device=str(device),
             precision=precision.name,
             timestamp_utc=utc_timestamp(),
+            context_tokens_processed=step_context_tokens,
+            padded_tokens_processed=step_padded_tokens,
+            validation_status=validation_status,
+            validation_seconds=time.perf_counter() - validation_started if should_validate else 0.0,
         )
         if record.micro_step - start_micro_step != gradient_accumulation_steps:
             raise RuntimeError("Optimizer update used an incomplete accumulation.")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from llm_architecture.checkpointing import read_native_checkpoint
+
 import argparse
 from dataclasses import asdict
 import json
@@ -144,10 +146,10 @@ def _run(args) -> None:
     model.set_gradient_checkpointing(True)
     resume_payload = None
     if args.resume_checkpoint is not None:
-        resume_payload = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=False)
+        resume_payload = read_native_checkpoint(args.resume_checkpoint, map_location="cpu")
         payload = resume_payload
     else:
-        payload = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+        payload = read_native_checkpoint(args.checkpoint, map_location="cpu")
     from llm_training.checkpointing import verify_checkpoint_checksum
     verify_checkpoint_checksum(args.resume_checkpoint or args.checkpoint)
     if payload.get("tokenizer_sha256") not in (None, file_sha256(args.tokenizer)):

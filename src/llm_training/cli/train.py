@@ -96,6 +96,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="adamw",
         help="Optimizer state format; adamw8bit reduces CUDA memory.",
     )
+    parser.add_argument("--checkpoint-storage-backend", choices=("legacy", "optimized"), default="legacy")
+    parser.add_argument("--checkpoint-store-root", type=Path)
+    parser.add_argument("--checkpoint-max-snapshots", type=int, default=None,
+                        help="Opt-in fresh-store cap; six states is the recommended policy.")
+    parser.add_argument("--checkpoint-max-bytes", type=int, default=None)
     parser.add_argument("--overwrite-log", action="store_true")
     return parser
 
@@ -312,6 +317,11 @@ def run(arguments: argparse.Namespace) -> int:
         raise ValueError("--num-workers must be non-negative.")
     if arguments.max_validation_batches <= 0:
         raise ValueError("--max-validation-batches must be positive.")
+    if arguments.checkpoint_max_snapshots is not None and arguments.checkpoint_storage_backend != 'optimized':
+        raise ValueError('Bounded retention requires the optimized backend.')
+    if arguments.checkpoint_max_bytes is not None and arguments.checkpoint_max_snapshots is None:
+        raise ValueError('A byte quota requires an explicit snapshot limit.')
+    retention = None
     max_steps = (
         training_config.max_steps
         if arguments.max_steps is None
@@ -319,6 +329,32 @@ def run(arguments: argparse.Namespace) -> int:
     )
     if max_steps <= 0:
         raise ValueError("--max-steps must be positive.")
+
+    if arguments.checkpoint_storage_backend == 'optimized':
+        from llm_training.preflight import (estimate_component_storage, checkpoint_publication_bound,
+            estimate_bounded_component_storage)
+        import shutil
+        # Construct on meta only: no GPU or parameter allocation before capacity approval.
+        with torch.device('meta'):
+            parameters = sum(p.numel() for p in LanguageModel(project_config.model).parameters())
+        plan = estimate_component_storage(model_bytes=parameters * 4,
+            optimizer_bytes=parameters * 8 + 1024**2, updated_generations=checkpoint_publication_bound(max_steps=max_steps,
+                checkpoint_interval=training_config.checkpoint_interval,
+                evaluation_interval=training_config.evaluation_interval))
+        if arguments.checkpoint_max_snapshots is not None:
+            options = dict(max_snapshots=arguments.checkpoint_max_snapshots)
+            if arguments.checkpoint_max_bytes is not None:
+                options['max_bytes'] = arguments.checkpoint_max_bytes
+            plan = estimate_bounded_component_storage(model_bytes=parameters * 4,
+                optimizer_bytes=parameters * 8 + 1024**2, retention=options)
+            retention = {k: plan['retention'][k] for k in
+                ('max_checkpoint_bytes', 'max_snapshots', 'max_bytes')}
+        target = arguments.checkpoint_store_root or arguments.checkpoint_dir
+        while not target.exists():
+            target = target.parent
+        free = shutil.disk_usage(target).free
+        if free < plan['required_free_bytes']:
+            raise RuntimeError(f"Optimized checkpoint capacity refused: free={free}, required={plan['required_free_bytes']}; no deletion enabled.")
 
     device = resolve_device(arguments.device)
     requested_precision = (
@@ -466,7 +502,8 @@ def run(arguments: argparse.Namespace) -> int:
     )
     checkpoint_manager = CheckpointManager(
         arguments.checkpoint_dir,
-        arguments.run_name,
+        arguments.run_name, backend=arguments.checkpoint_storage_backend,
+        store_root=arguments.checkpoint_store_root, retention=retention,
     )
     tokenizer_reference = manifest.get("tokenizer_path")
     tokenizer_checksum = manifest.get("tokenizer_sha256")
@@ -478,11 +515,27 @@ def run(arguments: argparse.Namespace) -> int:
     if tokenizer_checksum is not None and not isinstance(tokenizer_checksum, str):
         raise ValueError("Manifest tokenizer checksum must be a string.")
 
+    retention_stop_reason = None
+
+    def stop_before_update():
+        nonlocal retention_stop_reason
+        if retention_stop_reason is not None:
+            return True
+        if checkpoint_manager.optimized_store is not None and checkpoint_manager.optimized_store.policy:
+            from llm_training.checkpoint_retention import RetentionLimitReached
+            try:
+                checkpoint_manager.optimized_store.prepare_update(run_id)
+            except RetentionLimitReached:
+                retention_stop_reason = 'RETENTION_LIMIT_REACHED'
+                return True
+        return False
+
     def save_checkpoint(
         current_state: TrainingState,
         metrics: object,
         *,
         force: bool = False,
+        final: bool = False,
     ) -> None:
         optimizer_step = current_state.optimizer_step
         interval_boundary = (
@@ -537,11 +590,19 @@ def run(arguments: argparse.Namespace) -> int:
                 },
             },
         )
-        checkpoint_manager.save(
-            payload,
-            is_best=is_best,
-            milestone=interval_boundary,
-        )
+        nonlocal retention_stop_reason
+        from llm_training.checkpoint_retention import RetentionLimitReached
+        try:
+            checkpoint_manager.save(
+                payload,
+                is_best=is_best,
+                milestone=interval_boundary,
+                final=final,
+            )
+        except RetentionLimitReached:
+            if force or final:
+                raise
+            retention_stop_reason = 'RETENTION_LIMIT_REACHED'
 
     try:
         if arguments.resume is None:
@@ -643,8 +704,11 @@ def run(arguments: argparse.Namespace) -> int:
             run_id=run_id,
             logger=logger,
             on_optimizer_step=save_checkpoint,
+            stop_requested=stop_before_update,
             progress=True,
         )
+        if checkpoint_manager.optimized_store is not None and checkpoint_manager.optimized_store.policy:
+            save_checkpoint(state, object(), force=True, final=True)
     except KeyboardInterrupt:
         logger.flush()
         at_boundary = (
@@ -653,7 +717,7 @@ def run(arguments: argparse.Namespace) -> int:
             * training_config.gradient_accumulation_steps
         )
         if state.optimizer_step > 0 and at_boundary:
-            save_checkpoint(state, object(), force=True)
+            save_checkpoint(state, object(), force=True, final=True)
         _record_stop(
             logger,
             timestamp=utc_timestamp(),
@@ -680,13 +744,16 @@ def run(arguments: argparse.Namespace) -> int:
         logger,
         timestamp=utc_timestamp(),
         state=state,
-        status="completed",
+        status=retention_stop_reason or "completed",
     )
-    final = metrics[-1]
+    final = metrics[-1] if metrics else None
     print(f"Completed optimizer steps: {state.optimizer_step}")
     print(f"Completed micro-steps: {state.micro_step}")
     print(f"Tokens processed: {state.tokens_seen}")
-    print(f"Final loss: {final.training_loss:.6f}")
+    if final is not None:
+        print(f"Final loss: {final.training_loss:.6f}")
+    if retention_stop_reason:
+        print(f"Stopped safely: {retention_stop_reason}")
     print(f"Metrics: {logger.metrics_path}")
     print(f"Run metadata: {logger.metadata_path}")
     return 0
@@ -698,7 +765,8 @@ def main() -> None:
     config = load_config(arguments.config)
     with attached_viewer(
         metrics_path=arguments.log_dir / arguments.run_name / "train_metrics.jsonl",
-        checkpoint_path=arguments.checkpoint_dir / arguments.run_name / "latest.pt",
+        checkpoint_path=arguments.checkpoint_dir / arguments.run_name / (
+            "recovery-index.json" if arguments.checkpoint_storage_backend == "optimized" else "latest.pt"),
         total_steps=arguments.max_steps or config.training.max_steps,
         title="LLM base training",
     ):

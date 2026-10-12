@@ -16,6 +16,8 @@ from torch.utils.data import Dataset
 from llm_tokenizer.sft import ChatMessage, IGNORE_LABEL, serialize_conversation
 
 
+VIEWER_COMMAND_ENVIRONMENT = 'LLM_TRAINING_VIEWER_COMMAND'
+
 def atomic_json(path: Path, value: dict) -> None:
     """Replace one owned progress document atomically."""
     temporary = path.with_suffix('.tmp')
@@ -62,16 +64,26 @@ class ChatDataset(Dataset):
         return self.items[index]
 
 
-def start_chat_viewer(status: Path) -> subprocess.Popen:
+def start_chat_viewer(status: Path, *, title: str = "Codexa Stage 2 conversational SFT") -> subprocess.Popen:
     """Require automatic visible Kitty attachment before any training update."""
     if not shutil.which('kitty') or not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
         raise RuntimeError('A visible Kitty viewer is required for training.')
+    status.with_suffix(".attached").unlink(missing_ok=True)
     root = Path(os.environ.get("LLM_INTEGRATION_ROOT", Path.cwd())).resolve()
-    process = subprocess.Popen(['kitty', '--override', 'remember_window_size=no',
-                                '--override', 'initial_window_width=100c', '--override', 'initial_window_height=22c',
-                                '--title', 'Codexa Stage 2 conversational SFT',
-                                sys.executable, '-m', 'llm_training.conversational_training',
-                                '--view', str(status.resolve())], cwd=root)
+    # An integration may supply its own visible viewer (JSON argv). It must still attach
+    # by writing the marker, and the returned process must live while the viewer is open.
+    supplied = os.environ.get(VIEWER_COMMAND_ENVIRONMENT)
+    if supplied:
+        command = json.loads(supplied)
+        if not (isinstance(command, list) and command and all(isinstance(part, str) for part in command)):
+            raise ValueError(f'{VIEWER_COMMAND_ENVIRONMENT} must be a JSON list of strings.')
+        command = command + ['--status', str(status.resolve()), '--marker', str(status.with_suffix('.attached').resolve())]
+    else:
+        command = ['kitty', '--override', 'remember_window_size=no',
+                   '--override', 'initial_window_width=100c', '--override', 'initial_window_height=22c',
+                   '--title', title,
+                   sys.executable, '-m', 'llm_training.conversational_training', '--view', str(status.resolve())]
+    process = subprocess.Popen(command, cwd=root, start_new_session=True)
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
         if status.with_suffix('.attached').exists():
