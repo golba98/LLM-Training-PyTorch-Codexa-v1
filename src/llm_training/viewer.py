@@ -11,6 +11,45 @@ import tempfile
 import time
 def render_progress(status: dict) -> str:
     """Render the complete terminal dashboard without fixed token assumptions."""
+    if status.get("phase") in ("conversational", "foundational"):
+        mode = "FOUNDATIONAL" if status["phase"] == "foundational" else "CONVERSATIONAL"
+        unit = "target" if status["phase"] == "foundational" else "assistant"
+        step, total = status.get("step", 0), status.get("total_steps", 1)
+        percent = min(100.0, 100 * step / max(1, total))
+        filled = int(percent / 2)
+        def duration(value):
+            value = max(0, int(value or 0))
+            return f"{value // 3600:02d}:{value // 60 % 60:02d}:{value % 60:02d}"
+        def loss(key):
+            value = status.get(key)
+            return "--" if value is None else f"{value:.5f}"
+        def trend(key):
+            values = status.get(key, [])
+            if not values:
+                return '--'
+            low, high = min(values), max(values)
+            symbols = '.:-=+*#%@'
+            bars = ''.join(symbols[round((v-low)/max(high-low, 1e-12)*(len(symbols)-1))] for v in values)
+            return f'{bars} [{low:.2f}, {high:.2f}]'
+        return "\n".join([
+            f"  CODEXA | {mode} | {status.get('run_name', '--')}",
+            f"  {'#' * filled}{'-' * (50-filled)} {percent:5.1f}% ETA {duration(status.get('eta_seconds'))}",
+            f"  STATUS {status.get('state')}  STEPS {step}/{total}",
+            f"  PHASE {status.get('kind')} BF16 {status.get('activity', '')}",
+            f"  SPEED {status.get('tokens_per_second', 0):.0f} {unit} tok/s",
+            f"  TRAIN LOSS {loss('training_loss')}  VAL LOSS {loss('validation_loss')}",
+            f"  LOSS TREND {trend('loss_history')}",
+            f"  SPEED TREND {trend('speed_history')}",
+            f"  {unit.upper()} TOKENS {status.get('total_tokens_seen', 0):,}",
+            f"  CONTEXT TOKENS {status.get('context_tokens', 0):,}",
+            f"  COVERAGE {status.get('effective_epochs', 0):.3f} epochs",
+            f"  LR {status.get('learning_rate', 0):.3g}  PEAK VRAM {status.get('peak_vram_bytes', 0)/1024**3:.2f} GiB",
+            f"  ELAPSED {duration(status.get('elapsed_seconds'))} REMAINING {duration(status.get('remaining_seconds'))}",
+            f"  NEXT CHECKPOINT step {status.get('next_checkpoint_step', '--')}",
+            "  LATEST VERIFIED CHECKPOINT", str(status.get('checkpoint_path', '--'))[-96:],
+            "  INITIALIZATION", str(status.get('lineage', '--'))[-96:],
+            "  FINALIZATION RESERVE APPROACHING" if status.get('deadline_warning') else "  Deadline enforced independently of this viewer",
+            "  Closing this viewer does not stop training."])
     step = status.get("step", 0)
     total = status.get("total_steps", 1)
     percentage = min(100.0, 100.0 * step / max(total, 1))
